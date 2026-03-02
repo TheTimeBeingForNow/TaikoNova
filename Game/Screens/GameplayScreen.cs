@@ -1,0 +1,689 @@
+using System.Diagnostics;
+using OpenTK.Windowing.GraphicsLibraryFramework;
+using TaikoNova.Engine;
+using TaikoNova.Game.Beatmap;
+using TaikoNova.Game.Skin;
+using TaikoNova.Game.Taiko;
+
+namespace TaikoNova.Game.Screens;
+
+/// <summary>
+/// Main gameplay screen. Handles note scrolling, input, judgment,
+/// scoring, and all gameplay rendering.
+/// </summary>
+public class GameplayScreen : Screen
+{
+    // ── Beatmap ──
+    private BeatmapData _beatmap = null!;
+    private HitWindows _hitWindows = null!;
+    private ScoreProcessor _score = null!;
+    private Playfield _playfield = null!;
+    private NoteRenderer _noteRenderer = null!;
+
+    // ── Timing ──
+    private readonly Stopwatch _stopwatch = new();
+    private double _currentTime;
+    private double _startOffset;  // Lead-in time
+    private bool _started;
+    private bool _finished;
+    private bool _useAudio;
+
+    // ── Gameplay state ──
+    private int _nextHitIndex; // Index of next unhit note to check
+    private float _scrollSpeed;
+
+    // ── Drum input bindings ──
+    private static readonly Keys[] DonKeysLeft = { Keys.D, Keys.F };
+    private static readonly Keys[] KatKeysLeft = { Keys.J, Keys.K };
+    private static readonly Keys[] DonKeysRight = { Keys.D, Keys.F };
+    private static readonly Keys[] KatKeysRight = { Keys.J, Keys.K };
+    private static readonly Keys[] AllDonKeys = { Keys.D, Keys.F };
+    private static readonly Keys[] AllKatKeys = { Keys.J, Keys.K };
+
+    // ── Pause ──
+    private bool _paused;
+
+    // ── Background ──
+    private BackgroundManager _background = null!;
+
+    // ── Hit explosions ──
+    private struct Explosion
+    {
+        public double Time;
+        public bool IsDon;
+        public bool Active;
+    }
+    private Explosion[] _explosions = new Explosion[SkinConfig.MaxExplosions];
+    private int _nextExplosion;
+
+    // ── Combo milestones ──
+    private int _lastMilestone;
+    private double _milestoneTime;
+    private string _milestoneText = "";
+
+    // ── HP danger pulse ──
+    private float _hpPulse;
+
+    // ── Judgment bounce ──
+    private float _judgmentBounce;
+
+    // ── Transition guard ──
+    private bool _quitting;
+
+    public GameplayScreen(GameEngine engine, TaikoGame game) : base(engine, game)
+    {
+        _background = new BackgroundManager(engine);
+    }
+
+    /// <summary>Load a beatmap for play.</summary>
+    public void LoadBeatmap(BeatmapData beatmap, bool withAudio)
+    {
+        _beatmap = beatmap;
+        _useAudio = withAudio;
+        _hitWindows = new HitWindows(beatmap.OverallDifficulty);
+        _score = new ScoreProcessor(beatmap.HPDrainRate, beatmap.OverallDifficulty);
+        _playfield = new Playfield(Engine);
+        _noteRenderer = new NoteRenderer(Engine);
+        _scrollSpeed = SkinConfig.BaseScrollSpeed * beatmap.SliderMultiplier * Game.Settings.ScrollSpeed;
+        _playfield.BuildBarlines(beatmap);
+        _nextHitIndex = 0;
+        _started = false;
+        _finished = false;
+        _paused = false;
+        _lastMilestone = 0;
+        _milestoneTime = -9999;
+        _milestoneText = "";
+        _hpPulse = 0f;
+        _judgmentBounce = 0f;
+        _quitting = false;
+        _nextExplosion = 0;
+        for (int i = 0; i < _explosions.Length; i++)
+            _explosions[i].Active = false;
+
+        // Reset hit objects
+        foreach (var ho in _beatmap.HitObjects)
+        {
+            ho.IsHit = false;
+            ho.Result = HitResult.None;
+            ho.TicksHit = 0;
+        }
+
+        // Lead-in
+        _startOffset = Math.Max(2000, _beatmap.AudioLeadIn);
+
+        // Load background image / video (dim from settings)
+        _background.DimLevel = Game.Settings.BackgroundDim;
+        _background.Load(beatmap);
+    }
+
+    public override void OnEnter()
+    {
+        if (_beatmap == null) return;
+
+        // Try loading audio
+        if (_useAudio && !string.IsNullOrEmpty(_beatmap.AudioFilename))
+        {
+            string audioPath = Path.Combine(_beatmap.FolderPath, _beatmap.AudioFilename);
+            if (File.Exists(audioPath))
+            {
+                Engine.Audio.LoadMusic(audioPath);
+            }
+            else if (Beatmap.LazerAudioResolver.IsLazerPath(_beatmap.FilePath))
+            {
+                // Beatmap is from osu! lazer's hash store — try to resolve audio
+                Console.WriteLine($"[Gameplay] Audio not found at expected path (lazer hash store)");
+                Console.WriteLine($"[Gameplay] Attempting lazer audio resolution...");
+
+                string? resolved = Beatmap.LazerAudioResolver.ResolveAudio(
+                    _beatmap.FilePath, _beatmap.AudioFilename);
+
+                if (resolved != null)
+                {
+                    Console.WriteLine($"[Gameplay] Resolved lazer audio: {resolved}");
+                    Engine.Audio.LoadMusic(resolved);
+                }
+                else
+                {
+                    Console.WriteLine($"[Gameplay] Could not resolve lazer audio.");
+                    Console.WriteLine($"[Gameplay] Tip: Export the map from osu! lazer (right-click → Export)");
+                    Console.WriteLine($"[Gameplay]       and place the .osz file in the Songs folder.");
+                    _useAudio = false;
+                }
+            }
+            else
+            {
+                Console.WriteLine($"[Gameplay] Audio file not found: {audioPath}");
+                _useAudio = false;
+            }
+        }
+
+        // Start the clock
+        _stopwatch.Restart();
+        _currentTime = -_startOffset;
+
+        if (_useAudio && Engine.Audio.IsMusicLoaded)
+        {
+            // Will start audio after lead-in
+        }
+
+        _started = true;
+    }
+
+    public override void OnExit()
+    {
+        Engine.Audio.StopMusic();
+        _stopwatch.Stop();
+        _background.Unload();
+    }
+
+    public override void OnEscape()
+    {
+        if (_paused || _finished)
+        {
+            if (!_quitting)
+            {
+                _quitting = true;
+                Game.GoToSongSelect();
+            }
+            return;
+        }
+        else
+        {
+            _paused = !_paused;
+            if (_paused)
+            {
+                _stopwatch.Stop();
+                Engine.Audio.PauseMusic();
+            }
+            else
+            {
+                _stopwatch.Start();
+                if (_useAudio && Engine.Audio.IsMusicLoaded)
+                    Engine.Audio.PlayMusic();
+            }
+        }
+    }
+
+    public override void Update(double deltaTime)
+    {
+        if (!_started || _paused) return;
+
+        // ── Update time ──
+        if (_useAudio && Engine.Audio.IsPlaying)
+        {
+            _currentTime = Engine.Audio.MusicPosition + Game.Settings.GlobalOffset;
+        }
+        else
+        {
+            _currentTime = _stopwatch.Elapsed.TotalMilliseconds - _startOffset + Game.Settings.GlobalOffset;
+        }
+
+        // Update video background
+        _background.Update(_currentTime);
+
+        // Start audio when lead-in finishes
+        if (_useAudio && Engine.Audio.IsMusicLoaded && !Engine.Audio.IsPlaying && _currentTime >= 0)
+        {
+            Engine.Audio.SetMusicVolume(Game.Settings.MasterVolume * Game.Settings.MusicVolume);
+            Engine.Audio.PlayMusic();
+        }
+
+        // ── HP drain ──
+        _score.ApplyDrain(deltaTime * 1000);
+
+        // ── HP danger pulse ──
+        if (_score.HP <= 0.3)
+            _hpPulse = MathF.Min(1f, _hpPulse + (float)deltaTime * 4f);
+        else
+            _hpPulse = MathF.Max(0f, _hpPulse - (float)deltaTime * 3f);
+
+        // ── Combo milestones ──
+        int milestone = (_score.Combo / 50) * 50;
+        if (milestone > 0 && milestone > _lastMilestone)
+        {
+            _lastMilestone = milestone;
+            _milestoneTime = _currentTime;
+            _milestoneText = $"{milestone} COMBO!";
+        }
+        if (_score.Combo == 0) _lastMilestone = 0;
+
+        // ── Judgment bounce decay ──
+        _judgmentBounce = MathF.Max(0f, _judgmentBounce - (float)deltaTime * 6f);
+
+        // ── Check for missed notes ──
+        for (int i = _nextHitIndex; i < _beatmap.HitObjects.Count; i++)
+        {
+            var ho = _beatmap.HitObjects[i];
+            if (ho.IsHit) continue;
+
+            if (ho.IsNote)
+            {
+                if (_hitWindows.IsMissed(ho.Time, _currentTime))
+                {
+                    ho.IsHit = true;
+                    ho.Result = HitResult.Miss;
+                    _score.ApplyHit(HitResult.Miss, _currentTime);
+                    if (i == _nextHitIndex) _nextHitIndex++;
+                }
+            }
+            else if (ho.IsLong)
+            {
+                // Long notes auto-complete when their end time passes
+                if (_currentTime > ho.EndTime + 200)
+                {
+                    ho.IsHit = true;
+                    if (ho.TicksHit > 0)
+                        ho.Result = HitResult.Good;
+                    else
+                        ho.Result = HitResult.Miss;
+                    if (i == _nextHitIndex) _nextHitIndex++;
+                }
+            }
+            else
+            {
+                break; // Notes are sorted by time, stop early
+            }
+        }
+
+        // ── Process drum input ──
+        bool donHit = Engine.Input.AnyPressed(AllDonKeys);
+        bool katHit = Engine.Input.AnyPressed(AllKatKeys);
+
+        if (donHit) ProcessHit(true);
+        if (katHit) ProcessHit(false);
+
+        // ── Drumroll/Denden continuous input ──
+        bool donDown = Engine.Input.AnyDown(AllDonKeys);
+        bool katDown = Engine.Input.AnyDown(AllKatKeys);
+        if (donHit || katHit)
+        {
+            ProcessLongNoteHit();
+        }
+
+        // ── Advance next hit index past already-hit notes ──
+        while (_nextHitIndex < _beatmap.HitObjects.Count &&
+               _beatmap.HitObjects[_nextHitIndex].IsHit &&
+               _beatmap.HitObjects[_nextHitIndex].IsNote)
+        {
+            _nextHitIndex++;
+        }
+
+        // ── Check if map is finished ──
+        if (!_finished && !_quitting && _beatmap.HitObjects.Count > 0)
+        {
+            var lastObj = _beatmap.HitObjects[^1];
+            double lastTime = lastObj.IsLong ? lastObj.EndTime : lastObj.Time;
+            if (_currentTime > lastTime + 3000)
+            {
+                _finished = true;
+                Game.ShowResults(_beatmap, _score);
+            }
+        }
+    }
+
+    private void ProcessHit(bool isDon)
+    {
+        // Find the closest unhit note within the hit window
+        HitObject? bestNote = null;
+        double bestOffset = double.MaxValue;
+
+        for (int i = _nextHitIndex; i < _beatmap.HitObjects.Count; i++)
+        {
+            var ho = _beatmap.HitObjects[i];
+            if (ho.IsHit || !ho.IsNote) continue;
+
+            double offset = Math.Abs(_currentTime - ho.Time);
+            if (offset > _hitWindows.Miss) break; // Notes are sorted, no point continuing
+
+            // Check if the hit type matches
+            bool noteIsDon = ho.IsDon;
+            if (noteIsDon != isDon) continue;
+
+            if (offset < bestOffset)
+            {
+                bestOffset = offset;
+                bestNote = ho;
+            }
+        }
+
+        if (bestNote != null)
+        {
+            bestNote.IsHit = true;
+            bestNote.HitTime = _currentTime;
+
+            HitResult result = _hitWindows.Evaluate(bestOffset);
+            if (result == HitResult.None)
+                result = HitResult.Miss;
+
+            bestNote.Result = result;
+            _score.ApplyHit(result, _currentTime, bestNote.IsBig);
+
+            // Judgment bounce
+            _judgmentBounce = 1f;
+
+            // Visual feedback
+            if (isDon)
+                _playfield.FlashDon(_currentTime);
+            else
+                _playfield.FlashKat(_currentTime);
+
+            // Spawn hit explosion
+            if (result != HitResult.Miss)
+            {
+                ref var exp = ref _explosions[_nextExplosion % SkinConfig.MaxExplosions];
+                exp.Time = _currentTime;
+                exp.IsDon = isDon;
+                exp.Active = true;
+                _nextExplosion++;
+            }
+        }
+        else
+        {
+            // Hit but no matching note — just show flash (no penalty for empty hits)
+            if (isDon)
+                _playfield.FlashDon(_currentTime);
+            else
+                _playfield.FlashKat(_currentTime);
+        }
+    }
+
+    private void ProcessLongNoteHit()
+    {
+        // Check for active drumrolls/dendens
+        for (int i = 0; i < _beatmap.HitObjects.Count; i++)
+        {
+            var ho = _beatmap.HitObjects[i];
+            if (ho.IsHit || !ho.IsLong) continue;
+            if (_currentTime < ho.Time || _currentTime > ho.EndTime) continue;
+
+            ho.TicksHit++;
+            _score.ApplyTick(_currentTime);
+
+            if (ho.TicksHit >= ho.TicksRequired)
+            {
+                ho.IsHit = true;
+                ho.Result = HitResult.Great;
+            }
+            break; // Only process one long note at a time
+        }
+    }
+
+    public override void Render(double deltaTime)
+    {
+        var batch = Engine.SpriteBatch;
+        var font = Engine.Font;
+        var pixel = Engine.PixelTex;
+        var proj = Engine.Projection;
+        int sw = Engine.ScreenWidth;
+        int sh = Engine.ScreenHeight;
+
+        batch.Begin(proj);
+
+        // ── Background (beatmap image/video or fallback solid color) ──
+        if (_background.HasBackground)
+        {
+            _background.Render();
+        }
+        else
+        {
+            batch.Draw(pixel, 0, 0, sw, sh, SkinConfig.BgColor);
+        }
+
+        // ── Kiai background effect ──
+        if (_beatmap.IsKiaiAt(_currentTime))
+        {
+            batch.Draw(pixel, 0, 0, sw, sh, SkinConfig.KiaiGlow);
+        }
+
+        // ── Playfield ──
+        _playfield.Render(_currentTime, _scrollSpeed);
+
+        // ── Notes ──
+        _noteRenderer.RenderNotes(_beatmap.HitObjects, _currentTime, _scrollSpeed);
+
+        // ── Hit explosions ──
+        RenderExplosions();
+
+        // ── Judgment display ──
+        RenderJudgment();
+
+        // ── Combo milestone flash ──
+        RenderMilestone();
+
+        // ── HUD ──
+        RenderHUD();
+
+        // ── Pause overlay ──
+        if (_paused)
+        {
+            // Darkened background
+            batch.Draw(pixel, 0, 0, sw, sh, 0, 0, 0, 0.7f);
+
+            // Pause panel
+            float panW = 400, panH = 200;
+            float panX = sw / 2f - panW / 2f, panY = sh / 2f - panH / 2f;
+            batch.Draw(pixel, panX - 3, panY - 3, panW + 6, panH + 6, SkinConfig.NoteBorder);
+            batch.Draw(pixel, panX, panY, panW, panH, 0.10f, 0.08f, 0.12f, 0.95f);
+
+            // Accent line at top of panel
+            batch.Draw(pixel, panX, panY, panW, 3f,
+                SkinConfig.Accent[0], SkinConfig.Accent[1], SkinConfig.Accent[2], 0.8f);
+
+            font.DrawCenteredShadow(batch, "PAUSED", sw / 2f, panY + 50, 2.5f, 1f, 0.85f, 0.20f, 1f);
+            font.DrawCentered(batch, "ESC to resume", sw / 2f, panY + 110, 0.85f,
+                0.65f, 0.65f, 0.70f, 1f);
+            font.DrawCentered(batch, "ESC again to quit", sw / 2f, panY + 140, 0.7f,
+                0.45f, 0.45f, 0.50f, 0.8f);
+        }
+
+        batch.End();
+    }
+
+    private void RenderExplosions()
+    {
+        var batch = Engine.SpriteBatch;
+        var glow = Engine.GlowTex;
+        float cx = SkinConfig.HitPositionX;
+        float cy = SkinConfig.PlayfieldY;
+
+        for (int i = 0; i < _explosions.Length; i++)
+        {
+            ref var exp = ref _explosions[i];
+            if (!exp.Active) continue;
+
+            double age = _currentTime - exp.Time;
+            if (age < 0 || age > SkinConfig.ExplosionDuration)
+            {
+                exp.Active = false;
+                continue;
+            }
+
+            float t = (float)(age / SkinConfig.ExplosionDuration);
+            float ease = 1f - (1f - t) * (1f - t); // ease-out quad
+            float radius = SkinConfig.ExplosionMaxRadius * ease;
+            float alpha = (1f - t) * 0.45f;
+
+            float[] col = exp.IsDon ? SkinConfig.DonFlash : SkinConfig.KatFlash;
+
+            // Expanding ring
+            float ringSize = radius * 2f;
+            batch.Draw(Engine.RingTex, cx - radius, cy - radius, ringSize, ringSize,
+                col[0], col[1], col[2], alpha * 0.6f);
+
+            // Inner glow
+            float glowR = radius * 0.6f;
+            batch.Draw(glow, cx - glowR, cy - glowR, glowR * 2, glowR * 2,
+                col[0], col[1], col[2], alpha * 0.3f);
+        }
+    }
+
+    private void RenderMilestone()
+    {
+        double age = _currentTime - _milestoneTime;
+        if (age < 0 || age > SkinConfig.MilestoneFlashDuration || string.IsNullOrEmpty(_milestoneText))
+            return;
+
+        float t = (float)(age / SkinConfig.MilestoneFlashDuration);
+        // Bounce-in then fade-out
+        float scaleT = t < 0.3f ? EaseOutBack(t / 0.3f) : 1f;
+        float alpha = t < 0.6f ? 1f : 1f - (t - 0.6f) / 0.4f;
+        float scale = 1.5f * scaleT;
+        float y = SkinConfig.PlayfieldY - SkinConfig.TrackHeight / 2f - 90f;
+
+        Engine.Font.DrawCenteredShadow(Engine.SpriteBatch, _milestoneText,
+            SkinConfig.HitPositionX, y, scale,
+            SkinConfig.MilestoneColor[0], SkinConfig.MilestoneColor[1],
+            SkinConfig.MilestoneColor[2], alpha, 3f);
+    }
+
+    private void RenderJudgment()
+    {
+        if (_score.LastJudgment == HitResult.None) return;
+
+        double age = _currentTime - _score.LastJudgmentTime;
+        if (age > SkinConfig.JudgmentFade || age < 0) return;
+
+        float t = (float)(age / SkinConfig.JudgmentFade);
+        float alpha = t < 0.7f ? 1f : 1f - (t - 0.7f) / 0.3f; // hold then fade
+        float y = SkinConfig.PlayfieldY - SkinConfig.TrackHeight / 2f - 50f - t * 8f;
+        float x = SkinConfig.HitPositionX;
+
+        // Bounce easing for scale
+        float bounceT = MathF.Min(1f, t * 4f);
+        float bounce = bounceT < 1f ? EaseOutBack(bounceT) : 1f;
+        float scale = 1.0f + bounce * 0.35f + _judgmentBounce * 0.15f;
+
+        string text;
+        float[] color;
+
+        switch (_score.LastJudgment)
+        {
+            case HitResult.Great:
+                text = "GREAT";
+                color = SkinConfig.GreatColor;
+                break;
+            case HitResult.Good:
+                text = "GOOD";
+                color = SkinConfig.GoodColor;
+                break;
+            default:
+                text = "MISS";
+                color = SkinConfig.MissColor;
+                // Shake effect for miss
+                x += MathF.Sin(t * 30f) * (1f - t) * 6f;
+                break;
+        }
+
+        Engine.Font.DrawCenteredShadow(Engine.SpriteBatch, text, x, y, scale,
+            color[0], color[1], color[2], alpha);
+    }
+
+    private static float EaseOutBack(float t)
+    {
+        float c1 = 1.70158f;
+        float c3 = c1 + 1f;
+        float t1 = t - 1f;
+        return 1f + c3 * t1 * t1 * t1 + c1 * t1 * t1;
+    }
+
+    private void RenderHUD()
+    {
+        var batch = Engine.SpriteBatch;
+        var font = Engine.Font;
+        var pixel = Engine.PixelTex;
+        int sw = Engine.ScreenWidth;
+        int sh = Engine.ScreenHeight;
+        float m = SkinConfig.HudMargin;
+        float right = sw - m;
+
+        // ── HP bar (chunky pixel bar, top) ──
+        float hpW = SkinConfig.HpBarWidth;
+        float hpX = right - hpW;
+        float hpBarH = SkinConfig.HpBarH;
+        // Border with danger pulse
+        float dangerGlow = _hpPulse * (0.5f + 0.5f * MathF.Sin((float)_currentTime * 0.008f));
+        if (dangerGlow > 0.01f)
+        {
+            batch.Draw(pixel, hpX - 4, m - 4, hpW + 8, hpBarH + 8,
+                SkinConfig.HpDanger[0], SkinConfig.HpDanger[1], SkinConfig.HpDanger[2],
+                dangerGlow * 0.3f);
+        }
+        batch.Draw(pixel, hpX - 2, m - 2, hpW + 4, hpBarH + 4, SkinConfig.NoteBorder);
+        batch.Draw(pixel, hpX, m, hpW, hpBarH, SkinConfig.HpBg);
+        float fill = hpW * (float)_score.HP;
+        float[] hpCol = _score.HP > 0.3 ? SkinConfig.HpFill : SkinConfig.HpDanger;
+        batch.Draw(pixel, hpX, m, fill, hpBarH, hpCol);
+        // HP bar shine line
+        batch.Draw(pixel, hpX, m, fill, 2f, 1f, 1f, 1f, 0.12f);
+
+        // ── Score (top-right) ──
+        font.DrawTextRightShadow(batch, $"{_score.Score:D8}", right, m + 16, 1.6f,
+            1f, 1f, 1f, 1f);
+
+        // ── Accuracy (below score) ──
+        font.DrawTextRight(batch, _score.AccuracyDisplay, right, m + 52, 1.0f,
+            0.75f, 0.70f, 0.55f, 1f);
+
+        // ── Combo (below drum) ──
+        if (_score.Combo > 0)
+        {
+            float age = (float)(_currentTime - _score.ComboPopTime);
+            float s = 2.2f;
+            if (age >= 0 && age < SkinConfig.ComboPopMs)
+            {
+                float p = 1f - age / SkinConfig.ComboPopMs;
+                s *= 1f + p * (SkinConfig.ComboPopScale - 1f);
+            }
+
+            // Color shifts at milestones
+            float cr = 1f, cg = 0.85f, cb = 0.20f;
+            if (_score.Combo >= 100) { cr = 1f; cg = 0.5f; cb = 0.2f; }     // fiery
+            if (_score.Combo >= 200) { cr = 0.9f; cg = 0.2f; cb = 0.9f; }   // purple
+            if (_score.Combo >= 300) { cr = 0.3f; cg = 1f; cb = 0.95f; }    // cyan
+
+            float comboY = SkinConfig.PlayfieldY + SkinConfig.TrackHeight / 2f + 44;
+            font.DrawCenteredShadow(batch, _score.Combo.ToString(),
+                SkinConfig.HitPositionX, comboY, s, cr, cg, cb, 1f);
+
+            // Small "combo" label below the number
+            font.DrawCentered(batch, "COMBO", SkinConfig.HitPositionX, comboY + 26, 0.55f,
+                cr, cg, cb, 0.5f);
+        }
+
+        // ── Keys (pixel boxes, bottom-left) ──
+        float ky = sh - 42f;
+        float kw = 28f, kh = 28f, kg = 4f, kx = 12f;
+        Key(kx,                  ky, kw, kh, "D", Engine.Input.IsDown(Keys.D), true);
+        Key(kx + kw + kg,        ky, kw, kh, "F", Engine.Input.IsDown(Keys.F), true);
+        Key(kx + (kw+kg)*2 + 8,  ky, kw, kh, "J", Engine.Input.IsDown(Keys.J), false);
+        Key(kx + (kw+kg)*3 + 8,  ky, kw, kh, "K", Engine.Input.IsDown(Keys.K), false);
+
+        // ── Song (bottom, faint) ──
+        font.DrawText(batch, $"{_beatmap.DisplayArtist} - {_beatmap.DisplayTitle}",
+            12, sh - 16f, 0.6f, 0.40f, 0.32f, 0.22f, 1f);
+    }
+
+    private void Key(float x, float y, float w, float h, string l, bool on, bool don)
+    {
+        var batch = Engine.SpriteBatch;
+        // Dark border
+        batch.Draw(Engine.PixelTex, x - 2, y - 2, w + 4, h + 4, SkinConfig.NoteBorder);
+        if (on)
+        {
+            float[] c = don ? SkinConfig.DonColor : SkinConfig.KatColor;
+            batch.Draw(Engine.PixelTex, x, y, w, h, c);
+        }
+        else
+        {
+            batch.Draw(Engine.PixelTex, x, y, w, h, 0.16f, 0.12f, 0.08f, 0.7f);
+        }
+        Engine.Font.DrawCentered(batch, l, x + w/2, y + h/2, 0.7f,
+            1f, 1f, 1f, on ? 1f : 0.4f);
+    }
+
+    public override void Dispose()
+    {
+        Engine.Audio.StopMusic();
+        _background?.Dispose();
+    }
+}
